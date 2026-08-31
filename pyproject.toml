@@ -1,0 +1,21 @@
+[project]
+name = "xllm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "userName", email = "userEmail" }
+]
+requires-python = ">=3.6"
+dependencies = [
+    "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+]
+[project.scripts]
+xllm = "xllm:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

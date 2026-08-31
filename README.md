@@ -96,11 +96,12 @@ xllm/
 🚀 快速运行教程
 一、模型推理（快速体验）
 1. 下载预训练权重
-# ModelScope下载权重
-modelscope download --model xllm-base --local_dir ./xllm-base
+# 从 minimind 官方仓库下载预训练权重（本项目未上传权重）
+# ModelScope 国内高速下载
+modelscope download --model gongjy/minimind-3 --local_dir ./minimind-3
 
-# 或HuggingFace下载
-git clone 对应权重仓库地址
+# 或 HuggingFace 官方下载
+git clone https://huggingface.co/jingyaogong/minimind-3
 2. 命令行推理
 # 方式1：Transformers格式权重推理
 python eval_llm.py --load_from ./xllm-base

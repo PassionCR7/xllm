@@ -1,7 +1,7 @@
 # XLLM
 **基于轻量小模型从零复现的大语言模型项目，低成本、全流程可落地、适合 LLM 入门实战学习**
 
-⭐ **本项目为个人学习复现项目，基于 minimind（https://github.com/jingyaogong/minimind）和 MokioMind （https://github.com/Wood-Q/MokioMind）开源项目二次学习重构实现，完整复刻小参数 LLM 全链路训练、微调、强化学习、工具调用能力**
+⭐ **本项目为个人学习复现项目，基于 minimind（https://github.com/jingyaogong/minimind）和 MokioMind （https://github.com/Wood-Q/MokioMind）：开源项目二次学习重构实现，完整复刻小参数 LLM 全链路训练、微调、强化学习、工具调用能力**
 
 ## 📖 项目介绍
 XLLM 是一个**从零基于 PyTorch 原生实现的超轻量大语言模型项目**，专为 AI 入门学习者设计，以极低的算力成本、极简的代码结构，完整复现工业级 LLM 的全生命周期技术链路。

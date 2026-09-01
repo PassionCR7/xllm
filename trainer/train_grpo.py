@@ -148,25 +148,39 @@ def grpo_train_epoch(
             )
 
         completion_ids = outputs[:, prompt_inputs["input_ids"].size(1) :]
+        # 生成结束后及时回收 KV cache 占用的显存，为后续分块前向留出空间
+        torch.cuda.empty_cache()
 
-        def get_per_token_logps(mdl, input_ids, n_keep):
+        def get_per_token_logps(mdl, input_ids, n_keep, chunk_size=4):
+            # 分块前向以降低峰值显存：注意力分数矩阵大小为 O(B * seq_len^2)，
+            # GRPO 的 batch 被 num_generations 放大（如 2*8=16 条序列），一次性全量前向
+            # 在 8GB 显存上会 OOM（16*1602^2*8层≈5GB，另有常驻的 1.8B reward 模型）。
+            # 按 chunk_size 分批计算每行 logps 后拼接，逐行语义与原实现完全一致。
             input_ids = (
                 input_ids.detach().clone() if input_ids.is_inference() else input_ids
             )
-            logits = mdl(input_ids=input_ids, logits_to_keep=n_keep + 1).logits[
-                :, :-1, :
-            ]
-            per_token_logps = []
-            for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
-                ids_row = (
-                    ids_row.detach().clone() if ids_row.is_inference() else ids_row
-                )
-                token_logps = torch.gather(
-                    logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)
-                ).squeeze(1)
-                per_token_logps.append(token_logps)
-            return torch.stack(per_token_logps)
+            all_per_token_logps = []
+            n_rows = input_ids.size(0)
+            for start in range(0, n_rows, chunk_size):
+                chunk_ids = input_ids[start : start + chunk_size]
+                logits = mdl(
+                    input_ids=chunk_ids, logits_to_keep=n_keep + 1
+                ).logits[:, :-1, :]
+                for logits_row, ids_row in zip(logits, chunk_ids[:, -n_keep:]):
+                    ids_row = (
+                        ids_row.detach().clone() if ids_row.is_inference() else ids_row
+                    )
+                    token_logps = torch.gather(
+                        logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)
+                    ).squeeze(1)
+                    all_per_token_logps.append(token_logps)
+            return torch.stack(all_per_token_logps)
 
+        # 记录 rollout 时的行为策略（旧策略）logps，用于 GRPO 重要性比率 exp(new - old)
+        with torch.no_grad():
+            old_per_token_logps = get_per_token_logps(
+                model, outputs, completion_ids.size(1)
+            )
         per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))
         with torch.no_grad():
             ref_per_token_logps = get_per_token_logps(
@@ -196,14 +210,55 @@ def grpo_train_epoch(
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1
-        per_token_loss = -(
-            torch.exp(per_token_logps - per_token_logps.detach())
-            * advantages.unsqueeze(1)
-            - args.beta * per_token_kl
-        )
+        # 重要性比率：exp(新策略logp - 旧策略logp)，旧策略logp在rollout时捕获
+        ratio = torch.exp(per_token_logps - old_per_token_logps)
+        if args.loss_type == "cispo":
+            # ================= CISPO (Clipped Importance Sampling-weight Policy Optimization) =================
+            # 出处：MiniMax-M1 (arXiv:2506.13585)，GRPO 系变体，用于解决 PPO-clip 硬裁剪"丢弃 token"的问题。
+            # 核心思想：不裁剪 token 的更新（即不 mask 梯度），只裁剪"重要性采样权重"本身；
+            #           且裁剪后 .detach()（等价于论文中的 stop-gradient sg()），使梯度只从 logp 流出。
+            # 论文公式（token 级 + 组内相对 advantage Â，无价值模型）：
+            #   r_t    = π_θ(o_t|q,o_<t) / π_θ_old(o_t|q,o_<t) = exp(new_logp − old_logp)   ← 即上面的 ratio
+            #   r̂_t    = clip(r_t, 1−ε_low^IS, 1+ε_high^IS)     ← 实现上只封上界 max=epsilon_high（论文实践不设下界）
+            #   L_CISPO= − r̂_t(固定/stop-grad) · Â_t · log π_θ(o_t|q,o_<t) + β·KL
+            # 与 PPO-clip 的本质区别：任何 token 的梯度都不会被清零，只限制权重幅度；
+            #   低概率的"反思 token"（However/Recheck/Wait 等）不会被丢弃 → 长 CoT 推理更易涌现、熵更稳定。
+            clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
+            # ① 只对上界截断：clamp(ratio, max=epsilon_high) 等价于 clip(r, −∞, 1+ε_high)
+            #   ε_high 即 args.epsilon_high（默认 5.0）；下界不设，符合论文"只调 ε_high^IS"的实践。
+            # ② .detach() = stop-gradient：clamped_ratio 被当作常数系数、不回传梯度，
+            #   因此下方 per_token_loss 中只有 per_token_logps 参与求导（梯度恒保留，只是幅度受限）。
+            per_token_loss = -(
+                clamped_ratio * advantages.unsqueeze(1) * per_token_logps
+                - args.beta * per_token_kl
+            )
+
+            # 逐 token 损失 = -( 固定权重 * advantage * logp - beta*KL )
+            #   advantages.unsqueeze(1)：把 [B] 扩成 [B,1]，与 token 维度 [B,T] 广播相乘
+            #   外层负号把 -beta*KL 变成 +beta*KL：即对偏离参考策略 ref_model 的行为施加惩罚
+            #   注：原论文 CISPO 不含 KL 项；此处保留 beta*KL 是复现代码的工程取舍，可传 --beta 0 关闭。
+            # -------- 对照参考：若此处改为手动写 PPO-clip（而不走下方 else 分支），对应代码如下 --------
+            # # PPO-clip 目标（DeepSeekMath GRPO 的核心）：
+            # #   L = min( r*Â,  clip(r, 1-eps, 1+eps)*Â )  - beta*KL
+            # # min 双分支的隐式 mask：当 Â>0 且 r>1+eps（或 Â<0 且 r<1-eps）时，min 取到不依赖 θ 的常数分支，
+            # #   该 token 的梯度被清零（被"丢弃"）——这正是 CISPO 要避免的：CISPO 只封顶权重、从不把梯度归零。
+            # clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
+            # per_token_loss1 = ratio * advantages.unsqueeze(1)          # 未裁剪项 r*Â
+            # per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)  # 裁剪项 clip(r)*Â
+            # per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
+        else:
+            # GRPO（PPO-clip 风格，与上方"注释对照代码"逻辑等价，通过 --loss_type grpo 启用）：
+            #   min(ratio, clipped(ratio))*Â - beta*KL；超界 token 的梯度被 mask 清零（与 CISPO 的关键差异）
+            clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
+            per_token_loss1 = ratio * advantages.unsqueeze(1)
+            per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
+            per_token_loss = -(
+                torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl
+            )
 
         loss = (
-            (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+            (per_token_loss * completion_mask).sum(dim=1)
+            / completion_mask.sum(dim=1).clamp(min=1)
         ).mean() / args.accumulation_steps
         loss.backward()
 
@@ -215,7 +270,7 @@ def grpo_train_epoch(
             optimizer.zero_grad()
 
         if step % args.log_interval == 0 or step == iters:
-            policy_loss_val = loss.item()
+            policy_loss_val = loss.item() * args.accumulation_steps
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
             current_lr = optimizer.param_groups[0]["lr"]
@@ -260,7 +315,14 @@ def grpo_train_epoch(
             )
             model.train()
 
-        del prompt_inputs, outputs, completion_ids, per_token_logps, ref_per_token_logps
+        del (
+            prompt_inputs,
+            outputs,
+            completion_ids,
+            per_token_logps,
+            ref_per_token_logps,
+            old_per_token_logps,
+        )
         del (
             completions,
             rewards,
@@ -319,13 +381,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/rlaif-mini.jsonl",
+        default="../dataset/rlaif.jsonl",
         help="RLAIF数据路径",
     )
     parser.add_argument(
         "--num_generations", type=int, default=8, help="每个prompt生成的样本数"
     )
     parser.add_argument("--beta", type=float, default=0.02, help="KL惩罚系数")
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="cispo",
+        choices=["grpo", "cispo"],
+        help="loss类型（cispo=minimind默认，grpo=PPO-clip风格）",
+    )
+    parser.add_argument(
+        "--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon"
+    )
+    parser.add_argument(
+        "--epsilon_high", type=float, default=5.0, help="epsilon上界"
+    )
     parser.add_argument(
         "--reasoning",
         type=int,
@@ -336,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reward_model_path",
         type=str,
-        default="../../internlm2-1_8b-reward",
+        default="../dataset/internlm2-1_8b-reward",
         help="Reward模型路径",
     )
     parser.add_argument(
@@ -385,6 +460,7 @@ if __name__ == "__main__":
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
 
     model, tokenizer = init_model(lm_config, base_weight, device=args.device)
+    tokenizer.padding_side = "left"  # GRPO 在线生成需要左侧 padding，否则右 padding 会导致生成错位
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
